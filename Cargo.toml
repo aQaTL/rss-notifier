@@ -1,0 +1,13 @@
+[package]
+name = "rss-notifier"
+version = "0.1.0"
+authors = ["aQaTL <mmsoltys@outlook.com>"]
+edition = "2018"
+license = "MIT"
+
+[dependencies]
+toml = "0.5.6"
+serde = { version = "1.0.104", features = ["derive"] }
+native-tls = "0.2.3"
+lettre = "0.9.2"
+lettre_email = "0.9.2"
