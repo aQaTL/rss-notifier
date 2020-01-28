@@ -5,3 +5,4 @@ credentials.toml
 .idea
 .vscode
 cfg.toml
+*.json
