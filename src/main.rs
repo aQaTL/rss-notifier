@@ -17,6 +17,8 @@ use structopt::StructOpt;
 use tokio::time::interval;
 use url::Url;
 use uuid::Uuid;
+use handlebars::Handlebars;
+use lazy_static::lazy_static;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "rss-notifier")]
@@ -69,31 +71,74 @@ async fn start_email_task() {
         .await
         .expect(&(String::from("Failed to load ") + SITES_PATH));
 
-    let mut ticker = interval(Duration::from_secs(10));
-    while let _ = ticker.tick().await {
+    let mut ticker = interval(Duration::from_secs(60 * 60));
+    'ticker: while let _ = ticker.tick().await {
         info!("Checking sites...");
 
-        let sites = match load_sites_from_file_async(SITES_PATH).await {
-            Ok(new_sites) => {
-                sites = new_sites;
-                &sites
-            }
-            Err(e) => {
-                warn!("Failed to load {}: {:?}", SITES_PATH, e);
-                &sites
-            }
-        };
+        match load_sites_from_file_async(SITES_PATH).await {
+            Ok(new_sites) => sites = new_sites,
+            Err(e) => warn!("Failed to load {}: {:?}", SITES_PATH, e),
+        }
 
-        let check_results = join_all(sites.iter().map(check_site)).await;
+        let mut check_results = join_all(sites.iter_mut().map(check_site)).await;
 
-        for (site, new_items) in check_results {
-            println!(
+		let mut has_new_items = false;
+        for (site, new_items) in check_results.iter_mut() {
+            if new_items.is_empty() {
+				continue;
+            }
+            info!(
                 "Site: {} has {} new items",
                 site.name.as_deref().unwrap_or_default(),
                 new_items.len()
             );
+            site.last_accessed = chrono::offset::Utc::now();
+            has_new_items = true;
+        }
+
+        if !has_new_items {
+            continue 'ticker;
+        }
+
+        let (subject, body) = generate_email(&check_results).await;
+
+        info!("Sending email");
+        if let Err(e) = send_email(subject, body) {
+            warn!("Failed to send email: {:?}", e);
+        };
+
+        if let Err(e) = rss_sites::save_sites_async(SITES_PATH, &sites).await {
+            warn!("Failed to save {}: {:?}", SITES_PATH, e);
         }
     }
+}
+
+static EMAIL_TEMPLATE: &str = "email";
+
+lazy_static! {
+    static ref HANDLEBARS: Handlebars<'static> = {
+        let mut handlebars = Handlebars::new();
+        handlebars.set_strict_mode(true);
+        if let Err(e) = handlebars.register_template_string(EMAIL_TEMPLATE, include_str!("email.hb")) {
+            panic!("{:#?}", e)
+        }
+        handlebars
+    };
+}
+
+
+async fn generate_email(new_items: &[(&mut Site, Vec<rss::Item>)]) -> (String, String) {
+    let subject = match new_items.len() {
+        1 => format!("New updates from {}", new_items[0].0.name.as_deref().unwrap_or_else(|| new_items[0].0.url.as_str())),
+        count => format!("New updates from {} feeds", count),
+    };
+
+    let body = match HANDLEBARS.render(EMAIL_TEMPLATE, &new_items) {
+        Ok(v) => v,
+        Err(e) => panic!("{:#?}", e),
+    };
+
+    (subject, body)
 }
 
 #[derive(Debug, EnumFromImpler)]
@@ -106,8 +151,9 @@ enum CheckSiteError {
     Chrono(chrono::ParseError),
 }
 
-async fn check_site(site: &Site) -> (&Site, Vec<rss::Item>) {
-    match try_check_site(&site).await {
+//TODO transform to closure once async closures are stabilized
+async fn check_site(site: &mut Site) -> (&mut Site, Vec<rss::Item>) {
+    match try_check_site(site as &Site).await {
         Ok(v) => (site, v),
         Err(e) => {
             error!(
@@ -170,6 +216,8 @@ enum SendEmailError {
     Io(std::io::Error),
     #[impl_from]
     TomlDeserialize(toml::de::Error),
+    #[impl_from]
+    Smtp(lettre::smtp::error::Error)
 }
 
 //TODO return email client errors, not only std::io
@@ -202,7 +250,7 @@ fn send_email(subject: impl Into<String>, body: impl Into<String>) -> Result<(),
     .connection_reuse(ConnectionReuseParameters::ReuseUnlimited)
     .transport();
 
-    println!("{:?}", mailer.send(email.into()));
+    mailer.send(email.into())?;
 
     mailer.close();
     Ok(())
@@ -300,16 +348,16 @@ mod rss_sites {
     }
 
     #[derive(EnumFromImpler, Debug)]
-    pub enum AsyncLoadSitesError {
+    pub enum SitesAsyncIoError {
         #[impl_from]
         TokioIo(tokio::io::Error),
         #[impl_from]
-        Deserialization(serde_json::Error),
+        Serde(serde_json::Error),
     }
 
     pub async fn load_sites_from_file_async<P: AsRef<Path>>(
         path: P,
-    ) -> Result<Vec<Site>, AsyncLoadSitesError> {
+    ) -> Result<Vec<Site>, SitesAsyncIoError> {
         use tokio::{fs, io};
 
         let data = match fs::read(&path).await {
@@ -321,7 +369,7 @@ mod rss_sites {
                     let f = std::fs::File::create(path)?;
 
                     let sites: Vec<Site> = Vec::with_capacity(0);
-                    Result::<_, AsyncLoadSitesError>::Ok(serde_json::to_writer_pretty(f, &sites)?)
+                    Result::<_, SitesAsyncIoError>::Ok(serde_json::to_writer_pretty(f, &sites)?)
                 })
                 .await
                 .unwrap()?;
@@ -334,5 +382,15 @@ mod rss_sites {
         Ok(task::spawn_blocking(move || serde_json::from_slice(&data))
             .await
             .unwrap()?)
+    }
+
+    pub async fn save_sites_async(
+        path: &'static str,
+        sites: &[Site],
+    ) -> Result<(), SitesAsyncIoError> {
+        task::block_in_place(move || {
+            let f = std::fs::File::create(path)?;
+            Result::<_, SitesAsyncIoError>::Ok(serde_json::to_writer_pretty(f, sites)?)
+        })
     }
 }
