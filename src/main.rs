@@ -217,10 +217,13 @@ enum SendEmailError {
     #[impl_from]
     TomlDeserialize(toml::de::Error),
     #[impl_from]
-    Smtp(lettre::smtp::error::Error)
+    Smtp(lettre::smtp::error::Error),
+    #[impl_from]
+    Lettre(lettre_email::error::Error),
+    #[impl_from]
+    Tls(native_tls::Error),
 }
 
-//TODO return email client errors, not only std::io
 fn send_email(subject: impl Into<String>, body: impl Into<String>) -> Result<(), SendEmailError> {
     let cfg = toml::from_slice::<config::Config>(&std::fs::read("cfg.toml")?)?;
 
@@ -229,22 +232,20 @@ fn send_email(subject: impl Into<String>, body: impl Into<String>) -> Result<(),
         .from(cfg.credentials.username.clone())
         .subject(subject)
         .html(body)
-        .build()
-        .unwrap();
+        .build()?;
 
     let mut tls_builder = TlsConnector::builder();
     tls_builder.min_protocol_version(Some(Protocol::Tlsv10));
 
     let tls_parameters =
-        ClientTlsParameters::new(cfg.credentials.domain.clone(), tls_builder.build().unwrap());
+        ClientTlsParameters::new(cfg.credentials.domain.clone(), tls_builder.build()?);
 
     pub const SUBMISSION_PORT: u16 = 465;
 
     let mut mailer = SmtpClient::new(
         (cfg.credentials.domain.as_str(), SUBMISSION_PORT),
         ClientSecurity::Wrapper(tls_parameters),
-    )
-    .expect("Failed to create transport")
+    )?
     .authentication_mechanism(Mechanism::Login)
     .credentials(cfg.credentials)
     .connection_reuse(ConnectionReuseParameters::ReuseUnlimited)
