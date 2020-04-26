@@ -100,7 +100,7 @@ async fn start_email_task() {
             continue 'ticker;
         }
 
-        let (subject, body) = generate_email(&check_results).await;
+        let (subject, body) = generate_email(&check_results);
 
         info!("Sending email");
         if let Err(e) = send_email(subject, body) {
@@ -127,7 +127,7 @@ lazy_static! {
 }
 
 
-async fn generate_email(new_items: &[(&mut Site, Vec<rss::Item>)]) -> (String, String) {
+fn generate_email(new_items: &[(&mut Site, Vec<rss::Item>)]) -> (String, String) {
     let subject = match new_items.len() {
         1 => format!("New updates from {}", new_items[0].0.name.as_deref().unwrap_or_else(|| new_items[0].0.url.as_str())),
         count => format!("New updates from {} feeds", count),
