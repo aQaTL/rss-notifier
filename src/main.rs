@@ -93,7 +93,7 @@ async fn start_email_task() {
 
         info!("Sending email");
         if let Err(e) = send_email(subject, body) {
-            warn!("Failed to send email: {:?}", e);
+            error!("Failed to send email: {:?}", e);
             continue 'ticker;
         };
         info!("Email sent");
