@@ -65,7 +65,7 @@ fn run() -> io::Result<()> {
 
 #[allow(irrefutable_let_patterns)]
 async fn start_email_task() {
-    println!("Starting ticker");
+    info!("Starting ticker");
 
     let mut sites = load_sites_from_file_async(SITES_PATH)
         .await
@@ -86,6 +86,7 @@ async fn start_email_task() {
             .iter()
             .any(|(_, new_items)| !new_items.is_empty());
         if !has_new_items {
+            info!("Nothing new");
             continue 'ticker;
         }
 
@@ -181,7 +182,6 @@ async fn check_site(site: &mut Site) -> (&mut Site, Vec<rss::Item>) {
 async fn try_check_site(site: &Site) -> Result<Vec<rss::Item>, CheckSiteError> {
     let channel = fetch_rss(&site).await?;
 
-    println!("Feed: {}", channel.title());
     let mut new_items = Vec::new();
 
     for item in channel.items() {
