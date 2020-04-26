@@ -1,6 +1,8 @@
 use crate::rss_sites::{load_sites_from_file_async, Site};
 use enum_from_impler::EnumFromImpler;
 use futures::future::join_all;
+use handlebars::Handlebars;
+use lazy_static::lazy_static;
 use lettre::smtp::authentication::Mechanism;
 use lettre::smtp::ConnectionReuseParameters;
 use lettre::{ClientSecurity, ClientTlsParameters, SmtpClient, Transport};
@@ -17,8 +19,6 @@ use structopt::StructOpt;
 use tokio::time::interval;
 use url::Url;
 use uuid::Uuid;
-use handlebars::Handlebars;
-use lazy_static::lazy_static;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "rss-notifier")]
@@ -82,20 +82,9 @@ async fn start_email_task() {
 
         let mut check_results = join_all(sites.iter_mut().map(check_site)).await;
 
-		let mut has_new_items = false;
-        for (site, new_items) in check_results.iter_mut() {
-            if new_items.is_empty() {
-				continue;
-            }
-            info!(
-                "Site: {} has {} new items",
-                site.name.as_deref().unwrap_or_default(),
-                new_items.len()
-            );
-            site.last_accessed = chrono::offset::Utc::now();
-            has_new_items = true;
-        }
-
+        let has_new_items = check_results
+            .iter()
+            .any(|(_, new_items)| !new_items.is_empty());
         if !has_new_items {
             continue 'ticker;
         }
@@ -105,7 +94,21 @@ async fn start_email_task() {
         info!("Sending email");
         if let Err(e) = send_email(subject, body) {
             warn!("Failed to send email: {:?}", e);
+            continue 'ticker;
         };
+        info!("Email sent");
+
+        for (site, new_items) in check_results.iter_mut() {
+            if new_items.is_empty() {
+                continue;
+            }
+            info!(
+                "Site: {} has {} new items",
+                site.name.as_deref().unwrap_or_default(),
+                new_items.len()
+            );
+            site.last_accessed = chrono::offset::Utc::now();
+        }
 
         if let Err(e) = rss_sites::save_sites_async(SITES_PATH, &sites).await {
             warn!("Failed to save {}: {:?}", SITES_PATH, e);
@@ -119,17 +122,25 @@ lazy_static! {
     static ref HANDLEBARS: Handlebars<'static> = {
         let mut handlebars = Handlebars::new();
         handlebars.set_strict_mode(true);
-        if let Err(e) = handlebars.register_template_string(EMAIL_TEMPLATE, include_str!("email.hb")) {
+        if let Err(e) =
+            handlebars.register_template_string(EMAIL_TEMPLATE, include_str!("email.hb"))
+        {
             panic!("{:#?}", e)
         }
         handlebars
     };
 }
 
-
 fn generate_email(new_items: &[(&mut Site, Vec<rss::Item>)]) -> (String, String) {
     let subject = match new_items.len() {
-        1 => format!("New updates from {}", new_items[0].0.name.as_deref().unwrap_or_else(|| new_items[0].0.url.as_str())),
+        1 => format!(
+            "New updates from {}",
+            new_items[0]
+                .0
+                .name
+                .as_deref()
+                .unwrap_or_else(|| new_items[0].0.url.as_str())
+        ),
         count => format!("New updates from {} feeds", count),
     };
 
