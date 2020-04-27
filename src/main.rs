@@ -81,16 +81,17 @@ async fn start_email_task() {
         }
 
         let mut check_results = join_all(sites.iter_mut().map(check_site)).await;
-
-        let has_new_items = check_results
+        let results_with_new_items = check_results
             .iter()
-            .any(|(_, new_items)| !new_items.is_empty());
-        if !has_new_items {
+            .filter(|(_, new_items)| !new_items.is_empty())
+            .collect::<Vec<_>>();
+
+        if results_with_new_items.is_empty() {
             info!("Nothing new");
             continue 'ticker;
         }
 
-        let (subject, body) = generate_email(&check_results);
+        let (subject, body) = generate_email(&results_with_new_items);
 
         info!("Sending email");
         if let Err(e) = send_email(subject, body) {
@@ -132,7 +133,7 @@ lazy_static! {
     };
 }
 
-fn generate_email(new_items: &[(&mut Site, Vec<rss::Item>)]) -> (String, String) {
+fn generate_email(new_items: &[&(&mut Site, Vec<rss::Item>)]) -> (String, String) {
     let subject = match new_items.len() {
         1 => format!(
             "New updates from {}",
