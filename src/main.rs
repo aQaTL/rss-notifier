@@ -11,8 +11,7 @@ use log::*;
 use native_tls::Protocol;
 use native_tls::TlsConnector;
 use rss::Channel;
-use std::io;
-use std::io::BufReader;
+use std::io::{self, BufReader};
 use std::process::exit;
 use std::time::Duration;
 use structopt::StructOpt;
@@ -24,7 +23,10 @@ use uuid::Uuid;
 #[structopt(name = "rss-notifier")]
 enum Opt {
 	List,
-	Run,
+	Run {
+		#[structopt(long)]
+		no_webserver: bool,
+	},
 	Add {
 		#[structopt(short, long)]
 		name: Option<String>,
@@ -36,29 +38,50 @@ enum Opt {
 fn main() {
 	let opt = Opt::from_args();
 	match opt {
-		Opt::Run => run().unwrap(),
+		Opt::Run { no_webserver } => run(!no_webserver).unwrap(),
 		Opt::List => (),
 		Opt::Add { name, url } => add(name, url).unwrap(),
 	}
 }
 
-const SITES_PATH: &str = "sites_v2.json";
+#[derive(Debug, EnumFromImpler)]
+#[impl_from]
+enum RunError {
+	Io(std::io::Error),
+	Webserver(webserver::WebserverError),
+}
 
-fn run() -> io::Result<()> {
+fn run(with_webserver: bool) -> Result<(), RunError> {
 	if std::env::var("RUST_LOG").is_err() {
-		std::env::set_var("RUST_LOG", "rss_notifier");
+		std::env::set_var("RUST_LOG", "rss_notifier,actix_web");
 	}
 	env_logger::builder().format_module_path(false).init();
 
 	set_ctrlc_handler();
 
-	tokio::runtime::Builder::new()
+	let mut rt = tokio::runtime::Builder::new()
 		.threaded_scheduler()
 		.enable_io()
 		.enable_time()
 		.build()
-		.unwrap()
-		.block_on(start_email_task());
+		.unwrap();
+
+	let mut futures = vec![rt.spawn(start_email_task())];
+
+	if with_webserver {
+		let local_set = tokio::task::LocalSet::new();
+
+		let system_fut = actix::System::run_in_tokio("pleaseworkimtired", &local_set);
+		let webserver = webserver::webserver()?;
+
+		let handle = local_set.spawn_local(async move {
+			tokio::task::spawn_local(system_fut);
+			webserver.await.unwrap();
+		});
+		futures.push(handle);
+	}
+
+	rt.block_on(join_all(futures.into_iter()));
 
 	Ok(())
 }
@@ -67,17 +90,17 @@ fn run() -> io::Result<()> {
 async fn start_email_task() {
 	info!("Starting ticker");
 
-	let mut sites = load_sites_from_file_async(SITES_PATH)
+	let mut sites = load_sites_from_file_async()
 		.await
-		.expect(&(String::from("Failed to load ") + SITES_PATH));
+		.expect("Failed to load sites");
 
 	let mut ticker = interval(Duration::from_secs(60 * 60));
 	'ticker: while let _ = ticker.tick().await {
 		info!("Checking sites...");
 
-		match load_sites_from_file_async(SITES_PATH).await {
+		match load_sites_from_file_async().await {
 			Ok(new_sites) => sites = new_sites,
-			Err(e) => warn!("Failed to load {}: {:?}", SITES_PATH, e),
+			Err(e) => warn!("Failed to load sites: {:?}", e),
 		}
 
 		let mut check_results = join_all(sites.iter_mut().map(check_site)).await;
@@ -112,20 +135,26 @@ async fn start_email_task() {
 			site.last_accessed = chrono::offset::Utc::now();
 		}
 
-		if let Err(e) = rss_sites::save_sites_async(SITES_PATH, &sites).await {
-			warn!("Failed to save {}: {:?}", SITES_PATH, e);
+		if let Err(e) = rss_sites::save_sites_async(&sites).await {
+			warn!("Failed to save sites: {:?}", e);
 		}
 	}
 }
 
 static EMAIL_TEMPLATE: &str = "email";
+pub static INDEX_TEMPLATE: &str = "index";
 
 lazy_static! {
-	static ref HANDLEBARS: Handlebars<'static> = {
+	pub static ref HANDLEBARS: Handlebars<'static> = {
 		let mut handlebars = Handlebars::new();
 		handlebars.set_strict_mode(true);
 		if let Err(e) =
 			handlebars.register_template_string(EMAIL_TEMPLATE, include_str!("email.hb"))
+		{
+			panic!("{:#?}", e)
+		}
+		if let Err(e) =
+			handlebars.register_template_string(INDEX_TEMPLATE, include_str!("index.html"))
 		{
 			panic!("{:#?}", e)
 		}
@@ -201,14 +230,14 @@ async fn fetch_rss(site: &Site) -> Result<Channel, CheckSiteError> {
 }
 
 fn add(name: Option<String>, url: Url) -> io::Result<()> {
-	let rss_sites = rss_sites::RssSites::new(SITES_PATH).unwrap();
+	let rss_sites = rss_sites::RssSites::new().unwrap();
 	rss_sites.sites.lock().unwrap().push(rss_sites::Site {
 		uuid: Uuid::new_v4(),
 		name,
 		url,
 		last_accessed: chrono::MIN_DATE.and_hms(0, 0, 0),
 	});
-	rss_sites.save(SITES_PATH)?;
+	rss_sites.save(rss_sites::SITES_PATH)?;
 	Ok(())
 }
 
@@ -221,21 +250,17 @@ fn set_ctrlc_handler() {
 }
 
 #[derive(Debug, EnumFromImpler)]
+#[impl_from]
 enum SendEmailError {
-	#[impl_from]
 	Io(std::io::Error),
-	#[impl_from]
-	TomlDeserialize(toml::de::Error),
-	#[impl_from]
+	Config(config::ConfigLoadError),
 	Smtp(lettre::smtp::error::Error),
-	#[impl_from]
 	Lettre(lettre_email::error::Error),
-	#[impl_from]
 	Tls(native_tls::Error),
 }
 
 fn send_email(subject: impl Into<String>, body: impl Into<String>) -> Result<(), SendEmailError> {
-	let cfg = toml::from_slice::<config::Config>(&std::fs::read("cfg.toml")?)?;
+	let cfg = config::load_config()?;
 
 	let email = EmailBuilder::new()
 		.to(cfg.recipients[0].as_str())
@@ -268,13 +293,17 @@ fn send_email(subject: impl Into<String>, body: impl Into<String>) -> Result<(),
 }
 
 mod config {
+	use enum_from_impler::EnumFromImpler;
 	use lettre::smtp::authentication::Credentials as LettreCredentials;
 	use serde::Deserialize;
+
+	const CONFIG_FILE: &str = "cfg.toml";
 
 	#[derive(Deserialize, Debug)]
 	pub struct Config {
 		pub credentials: Credentials,
 		pub recipients: Vec<String>,
+		pub webserver_address: std::net::SocketAddr,
 	}
 
 	#[derive(Deserialize, Debug)]
@@ -288,6 +317,17 @@ mod config {
 		fn into(self) -> LettreCredentials {
 			LettreCredentials::new(self.username, self.password)
 		}
+	}
+
+	#[derive(Debug, EnumFromImpler)]
+	#[impl_from]
+	pub enum ConfigLoadError {
+		Io(std::io::Error),
+		Toml(toml::de::Error),
+	}
+
+	pub fn load_config() -> Result<Config, ConfigLoadError> {
+		toml::from_slice::<Config>(&std::fs::read(CONFIG_FILE)?).map_err(From::from)
 	}
 }
 
@@ -303,6 +343,8 @@ mod rss_sites {
 	use tokio::task;
 	use url::Url;
 
+	pub const SITES_PATH: &str = "sites_v2.json";
+
 	#[derive(Serialize, Deserialize, Debug, Clone)]
 	pub struct Site {
 		pub uuid: uuid::Uuid,
@@ -316,10 +358,10 @@ mod rss_sites {
 	}
 
 	impl RssSites {
-		pub fn new<P: AsRef<Path>>(path: P) -> notify::Result<RssSites> {
+		pub fn new() -> notify::Result<RssSites> {
 			debug!("initing RssSites");
 			let rss_sites = RssSites {
-				sites: Arc::new(Mutex::new(load_sites_from_file(&path).unwrap())),
+				sites: Arc::new(Mutex::new(load_sites_from_file().unwrap())),
 			};
 			let sites_c = rss_sites.sites.clone();
 			let mut watcher: RecommendedWatcher = Watcher::new_immediate(move |res| {
@@ -332,7 +374,7 @@ mod rss_sites {
 				}
 			})?;
 			watcher.configure(notify::Config::PreciseEvents(true))?;
-			watcher.watch(path, RecursiveMode::NonRecursive)?;
+			watcher.watch(SITES_PATH, RecursiveMode::NonRecursive)?;
 
 			Ok(rss_sites)
 		}
@@ -344,11 +386,11 @@ mod rss_sites {
 		}
 	}
 
-	fn load_sites_from_file<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<Site>> {
-		let data = match std::fs::read(&path) {
+	pub(crate) fn load_sites_from_file() -> std::io::Result<Vec<Site>> {
+		let data = match std::fs::read(SITES_PATH) {
 			Ok(v) => v,
 			Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-				let f = std::fs::File::create(path)?;
+				let f = std::fs::File::create(SITES_PATH)?;
 				let sites = Vec::new();
 				serde_json::to_writer_pretty(f, &sites)?;
 				return Ok(sites);
@@ -359,28 +401,24 @@ mod rss_sites {
 	}
 
 	#[derive(EnumFromImpler, Debug)]
-	pub enum SitesAsyncIoError {
+	pub enum SitesIoError {
 		#[impl_from]
 		TokioIo(tokio::io::Error),
 		#[impl_from]
 		Serde(serde_json::Error),
 	}
 
-	pub async fn load_sites_from_file_async<P: AsRef<Path>>(
-		path: P,
-	) -> Result<Vec<Site>, SitesAsyncIoError> {
+	pub async fn load_sites_from_file_async() -> Result<Vec<Site>, SitesIoError> {
 		use tokio::{fs, io};
 
-		let data = match fs::read(&path).await {
+		let data = match fs::read(&SITES_PATH).await {
 			Ok(v) => v,
 			Err(err) if err.kind() == io::ErrorKind::NotFound => {
-				let path = path.as_ref().to_owned();
-
 				task::spawn_blocking(move || {
-					let f = std::fs::File::create(path)?;
+					let f = std::fs::File::create(SITES_PATH)?;
 
 					let sites: Vec<Site> = Vec::with_capacity(0);
-					Result::<_, SitesAsyncIoError>::Ok(serde_json::to_writer_pretty(f, &sites)?)
+					Result::<_, SitesIoError>::Ok(serde_json::to_writer_pretty(f, &sites)?)
 				})
 				.await
 				.unwrap()?;
@@ -395,13 +433,91 @@ mod rss_sites {
 			.unwrap()?)
 	}
 
+	pub fn save_sites(sites: &[Site]) -> Result<(), SitesIoError> {
+		let f = std::fs::File::create(SITES_PATH)?;
+		Result::<_, SitesIoError>::Ok(serde_json::to_writer_pretty(f, sites)?)
+	}
+
 	pub async fn save_sites_async(
-		path: &'static str,
 		sites: &[Site],
-	) -> Result<(), SitesAsyncIoError> {
+	) -> Result<(), SitesIoError> {
 		task::block_in_place(move || {
-			let f = std::fs::File::create(path)?;
-			Result::<_, SitesAsyncIoError>::Ok(serde_json::to_writer_pretty(f, sites)?)
+			save_sites(&sites)
 		})
+	}
+}
+
+mod webserver {
+	use crate::{config, rss_sites};
+	use actix_web::middleware::Logger;
+	use actix_web::web::{get, post, Form};
+	use actix_web::{App, HttpServer, Responder, HttpResponse, ResponseError};
+	use enum_from_impler::EnumFromImpler;
+	use actix_web::dev::{Server, HttpResponseBuilder};
+	use url::Url;
+	use serde::Deserialize;
+	use std::fmt::Display;
+
+	#[derive(Debug, EnumFromImpler)]
+	#[impl_from]
+	pub enum WebserverError {
+		Config(config::ConfigLoadError),
+		Io(std::io::Error),
+	}
+
+	pub fn webserver() -> Result<Server, WebserverError> {
+		let cfg = config::load_config()?;
+
+		let server = HttpServer::new(move || {
+			App::new()
+				.wrap(Logger::new(r#" %a "%r" %s %T"#))
+				.route("/", get().to(index))
+				.route("/add_site", post().to(add_site))
+		})
+		.bind(cfg.webserver_address)?;
+		Ok(server.run())
+	}
+
+	async fn index() -> impl Responder {
+		let render = crate::HANDLEBARS.render(crate::INDEX_TEMPLATE, &()).unwrap();
+		HttpResponse::Ok().content_type("text/html").body(render)
+	}
+
+	#[derive(EnumFromImpler, Debug)]
+	#[impl_from]
+	enum AddSiteError {
+		Io(std::io::Error),
+		RssSitesDb(rss_sites::SitesIoError),
+	}
+
+	impl ResponseError for AddSiteError {
+		fn error_response(&self) -> HttpResponse {
+			log::error!("Error: {:?}", self);
+			HttpResponseBuilder::new(self.status_code()).body(format!("{}", self))
+		}
+	}
+
+	impl Display for AddSiteError {
+		fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+			write!(f, "<h1>internal server error</h1>")
+		}
+	}
+
+	#[derive(Deserialize)]
+	struct NewSite {
+		name: Option<String>,
+		url: Url,
+	}
+
+	async fn add_site(Form(new_site): Form<NewSite>) -> Result<impl Responder, AddSiteError> {
+		let mut sites = rss_sites::load_sites_from_file()?;
+		sites.push(rss_sites::Site {
+			uuid: uuid::Uuid::new_v4(),
+			name: new_site.name,
+			url: new_site.url,
+			last_accessed: chrono::Utc::now(),
+		});
+		rss_sites::save_sites(&sites)?;
+		Ok(HttpResponse::Created().body(""))
 	}
 }
