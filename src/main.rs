@@ -469,7 +469,10 @@ mod webserver {
 				actix_web::web::get().to(||
 					actix_web::HttpResponse::Ok()
 						.set_header(actix_web::http::header::CONTENT_TYPE, mime_guess::from_path($file).first_or_octet_stream())
-						.body(include_str!(concat!($dir, $file)))
+						.body({
+							let bytes = include_bytes!(concat!($dir, $file));
+							unsafe { std::slice::from_raw_parts(bytes as *const u8, bytes.len()) }
+						})
 				)
 			))*
 		}};
@@ -483,7 +486,7 @@ mod webserver {
 				.wrap(Logger::new(r#" %a "%r" %s %T"#))
 				.route("/add_site", post().to(add_site))
 				.route("/", get().to(index));
-			static_sites!(app, "static/", ["98.css"])
+			static_sites!(app, "static/", ["98.css", "ms_sans_serif.woff2"])
 		})
 		.bind(cfg.webserver_address)?;
 		Ok(server.run())
