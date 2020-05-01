@@ -142,7 +142,6 @@ async fn start_email_task() {
 }
 
 static EMAIL_TEMPLATE: &str = "email";
-pub static INDEX_TEMPLATE: &str = "index";
 
 lazy_static! {
 	pub static ref HANDLEBARS: Handlebars<'static> = {
@@ -150,11 +149,6 @@ lazy_static! {
 		handlebars.set_strict_mode(true);
 		if let Err(e) =
 			handlebars.register_template_string(EMAIL_TEMPLATE, include_str!("static/email.hb"))
-		{
-			panic!("{:#?}", e)
-		}
-		if let Err(e) =
-			handlebars.register_template_string(INDEX_TEMPLATE, include_str!("static/index.html"))
 		{
 			panic!("{:#?}", e)
 		}
@@ -493,10 +487,9 @@ mod webserver {
 	}
 
 	async fn index() -> impl Responder {
-		let render = crate::HANDLEBARS
-			.render(crate::INDEX_TEMPLATE, &())
-			.unwrap();
-		HttpResponse::Ok().content_type("text/html").body(render)
+		HttpResponse::Ok()
+			.content_type("text/html")
+			.body(include_str!("static/index.html"))
 	}
 
 	#[derive(EnumFromImpler, Debug)]
