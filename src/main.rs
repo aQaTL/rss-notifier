@@ -149,12 +149,12 @@ lazy_static! {
 		let mut handlebars = Handlebars::new();
 		handlebars.set_strict_mode(true);
 		if let Err(e) =
-			handlebars.register_template_string(EMAIL_TEMPLATE, include_str!("email.hb"))
+			handlebars.register_template_string(EMAIL_TEMPLATE, include_str!("static/email.hb"))
 		{
 			panic!("{:#?}", e)
 		}
 		if let Err(e) =
-			handlebars.register_template_string(INDEX_TEMPLATE, include_str!("index.html"))
+			handlebars.register_template_string(INDEX_TEMPLATE, include_str!("static/index.html"))
 		{
 			panic!("{:#?}", e)
 		}
@@ -438,25 +438,21 @@ mod rss_sites {
 		Result::<_, SitesIoError>::Ok(serde_json::to_writer_pretty(f, sites)?)
 	}
 
-	pub async fn save_sites_async(
-		sites: &[Site],
-	) -> Result<(), SitesIoError> {
-		task::block_in_place(move || {
-			save_sites(&sites)
-		})
+	pub async fn save_sites_async(sites: &[Site]) -> Result<(), SitesIoError> {
+		task::block_in_place(move || save_sites(&sites))
 	}
 }
 
 mod webserver {
 	use crate::{config, rss_sites};
+	use actix_web::dev::{HttpResponseBuilder, Server};
 	use actix_web::middleware::Logger;
 	use actix_web::web::{get, post, Form};
-	use actix_web::{App, HttpServer, Responder, HttpResponse, ResponseError};
+	use actix_web::{App, HttpResponse, HttpServer, Responder, ResponseError};
 	use enum_from_impler::EnumFromImpler;
-	use actix_web::dev::{Server, HttpResponseBuilder};
-	use url::Url;
 	use serde::Deserialize;
 	use std::fmt::Display;
+	use url::Url;
 
 	#[derive(Debug, EnumFromImpler)]
 	#[impl_from]
@@ -465,21 +461,38 @@ mod webserver {
 		Io(std::io::Error),
 	}
 
+	macro_rules! static_sites {
+		($app:ident, $dir:tt, [$($file:tt),* $(,)*] $(,)*) => {{
+			$app
+			$(.route(
+				$file,
+				actix_web::web::get().to(||
+					actix_web::HttpResponse::Ok()
+						.set_header(actix_web::http::header::CONTENT_TYPE, mime_guess::from_path($file).first_or_octet_stream())
+						.body(include_str!(concat!($dir, $file)))
+				)
+			))*
+		}};
+	}
+
 	pub fn webserver() -> Result<Server, WebserverError> {
 		let cfg = config::load_config()?;
 
 		let server = HttpServer::new(move || {
-			App::new()
+			let app = App::new()
 				.wrap(Logger::new(r#" %a "%r" %s %T"#))
-				.route("/", get().to(index))
 				.route("/add_site", post().to(add_site))
+				.route("/", get().to(index));
+			static_sites!(app, "static/", ["98.css"])
 		})
 		.bind(cfg.webserver_address)?;
 		Ok(server.run())
 	}
 
 	async fn index() -> impl Responder {
-		let render = crate::HANDLEBARS.render(crate::INDEX_TEMPLATE, &()).unwrap();
+		let render = crate::HANDLEBARS
+			.render(crate::INDEX_TEMPLATE, &())
+			.unwrap();
 		HttpResponse::Ok().content_type("text/html").body(render)
 	}
 
