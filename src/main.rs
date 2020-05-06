@@ -1,5 +1,6 @@
 use crate::rss_sites::{load_sites_from_file_async, Site};
 use enum_from_impler::EnumFromImpler;
+use futures::future;
 use futures::future::join_all;
 use handlebars::Handlebars;
 use lazy_static::lazy_static;
@@ -26,6 +27,8 @@ enum Opt {
 	Run {
 		#[structopt(long)]
 		no_webserver: bool,
+		#[structopt(long)]
+		no_rss_checker: bool,
 	},
 	Add {
 		#[structopt(short, long)]
@@ -38,7 +41,10 @@ enum Opt {
 fn main() {
 	let opt = Opt::from_args();
 	match opt {
-		Opt::Run { no_webserver } => run(!no_webserver).unwrap(),
+		Opt::Run {
+			no_webserver,
+			no_rss_checker,
+		} => run(!no_webserver, no_rss_checker).unwrap(),
 		Opt::List => (),
 		Opt::Add { name, url } => add(name, url).unwrap(),
 	}
@@ -51,7 +57,7 @@ enum RunError {
 	Webserver(webserver::WebserverError),
 }
 
-fn run(with_webserver: bool) -> Result<(), RunError> {
+fn run(with_webserver: bool, no_rss_checker: bool) -> Result<(), RunError> {
 	if std::env::var("RUST_LOG").is_err() {
 		std::env::set_var("RUST_LOG", "rss_notifier,actix_web");
 	}
@@ -66,22 +72,20 @@ fn run(with_webserver: bool) -> Result<(), RunError> {
 		.build()
 		.unwrap();
 
-	let mut futures = vec![rt.spawn(start_email_task())];
+	let rss_checker = if !no_rss_checker {
+		rt.spawn(start_email_task())
+	} else {
+		rt.spawn(future::pending())
+	};
 
 	if with_webserver {
 		let local_set = tokio::task::LocalSet::new();
-
-		let system_fut = actix::System::run_in_tokio("pleaseworkimtired", &local_set);
-		let webserver = webserver::webserver()?;
-
-		let handle = local_set.spawn_local(async move {
-			tokio::task::spawn_local(system_fut);
-			webserver.await.unwrap();
-		});
-		futures.push(handle);
+		let system = actix::System::run_in_tokio("pleaseworkimtired", &local_set);
+		local_set.spawn_local(system);
+		webserver::webserver()?;
 	}
 
-	rt.block_on(join_all(futures.into_iter()));
+	rt.block_on(rss_checker).unwrap();
 
 	Ok(())
 }
@@ -142,15 +146,20 @@ async fn start_email_task() {
 }
 
 static EMAIL_TEMPLATE: &str = "email";
+static MSG_TEMPLATE: &str = "msg";
 
 lazy_static! {
 	pub static ref HANDLEBARS: Handlebars<'static> = {
 		let mut handlebars = Handlebars::new();
 		handlebars.set_strict_mode(true);
-		if let Err(e) =
-			handlebars.register_template_string(EMAIL_TEMPLATE, include_str!("static/email.hb"))
-		{
-			panic!("{:#?}", e)
+		let templates = [
+			(EMAIL_TEMPLATE, include_str!("static/email.hb")),
+			(MSG_TEMPLATE, include_str!("static/msg.html")),
+		];
+		for template in &templates {
+			if let Err(e) = handlebars.register_template_string(template.0, template.1) {
+				panic!("{:#?}", e)
+			}
 		}
 		handlebars
 	};
@@ -438,13 +447,13 @@ mod rss_sites {
 }
 
 mod webserver {
-	use crate::{config, rss_sites};
+	use crate::{config, rss_sites, HANDLEBARS, MSG_TEMPLATE};
 	use actix_web::dev::{HttpResponseBuilder, Server};
 	use actix_web::middleware::Logger;
 	use actix_web::web::{get, post, Form};
 	use actix_web::{App, HttpResponse, HttpServer, Responder, ResponseError};
 	use enum_from_impler::EnumFromImpler;
-	use serde::Deserialize;
+	use serde::{Deserialize, Serialize};
 	use std::fmt::Display;
 	use url::Url;
 
@@ -494,19 +503,20 @@ mod webserver {
 
 	#[derive(EnumFromImpler, Debug)]
 	#[impl_from]
-	enum AddSiteError {
+	enum ErrorResponse {
 		Io(std::io::Error),
 		RssSitesDb(rss_sites::SitesIoError),
+		Render(handlebars::RenderError),
 	}
 
-	impl ResponseError for AddSiteError {
+	impl ResponseError for ErrorResponse {
 		fn error_response(&self) -> HttpResponse {
 			log::error!("Error: {:?}", self);
 			HttpResponseBuilder::new(self.status_code()).body(format!("{}", self))
 		}
 	}
 
-	impl Display for AddSiteError {
+	impl Display for ErrorResponse {
 		fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
 			write!(f, "<h1>internal server error</h1>")
 		}
@@ -518,7 +528,12 @@ mod webserver {
 		url: Url,
 	}
 
-	async fn add_site(Form(new_site): Form<NewSite>) -> Result<impl Responder, AddSiteError> {
+	#[derive(Serialize, Default)]
+	struct MsgDialog {
+		msg: Option<String>,
+	}
+
+	async fn add_site(Form(new_site): Form<NewSite>) -> Result<impl Responder, ErrorResponse> {
 		let mut sites = rss_sites::load_sites_from_file()?;
 		sites.push(rss_sites::Site {
 			uuid: uuid::Uuid::new_v4(),
@@ -527,6 +542,16 @@ mod webserver {
 			last_accessed: chrono::Utc::now(),
 		});
 		rss_sites::save_sites(&sites)?;
-		Ok(HttpResponse::Created().body(""))
+
+		let resp = HANDLEBARS.render(
+			MSG_TEMPLATE,
+			&MsgDialog {
+				msg: Some(format!(
+					"{} has been added",
+					sites.last().unwrap().name.as_deref().unwrap_or_default()
+				)),
+			},
+		)?;
+		Ok(HttpResponse::Created().body(resp))
 	}
 }
