@@ -464,7 +464,7 @@ mod webserver {
 		Io(std::io::Error),
 	}
 
-	macro_rules! static_sites {
+	macro_rules! static_files {
 		($app:ident, $dir:tt, [$($file:tt),* $(,)*] $(,)*) => {{
 			$app
 			$(.route(
@@ -489,7 +489,7 @@ mod webserver {
 				.wrap(Logger::new(r#" %a "%r" %s %T"#))
 				.route("/add_site", post().to(add_site))
 				.route("/", get().to(index));
-			static_sites!(app, "static/", ["98.css", "ms_sans_serif.woff2"])
+			static_files!(app, "static/", ["98.css"])
 		})
 		.bind(cfg.webserver_address)?;
 		Ok(server.run())
