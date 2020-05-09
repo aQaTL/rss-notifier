@@ -4,7 +4,6 @@ use futures::future;
 use futures::future::join_all;
 use handlebars::Handlebars;
 use lazy_static::lazy_static;
-use lettre::smtp::authentication::Mechanism;
 use lettre::smtp::ConnectionReuseParameters;
 use lettre::{ClientSecurity, ClientTlsParameters, SmtpClient, Transport};
 use lettre_email::EmailBuilder;
@@ -275,17 +274,17 @@ fn send_email(subject: impl Into<String>, body: impl Into<String>) -> Result<(),
 	let mut tls_builder = TlsConnector::builder();
 	tls_builder.min_protocol_version(Some(Protocol::Tlsv10));
 
-	let tls_parameters =
+	let _tls_parameters =
 		ClientTlsParameters::new(cfg.credentials.domain.clone(), tls_builder.build()?);
 
-	pub const SUBMISSION_PORT: u16 = 465;
+	pub const SUBMISSION_PORT: u16 = 25;
 
 	let mut mailer = SmtpClient::new(
 		(cfg.credentials.domain.as_str(), SUBMISSION_PORT),
-		ClientSecurity::Wrapper(tls_parameters),
+		ClientSecurity::None,
 	)?
-	.authentication_mechanism(Mechanism::Login)
-	.credentials(cfg.credentials)
+	// .authentication_mechanism(Mechanism::Login)
+	// .credentials(cfg.credentials)
 	.connection_reuse(ConnectionReuseParameters::ReuseUnlimited)
 	.transport();
 
