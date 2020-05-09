@@ -277,7 +277,7 @@ fn send_email(subject: impl Into<String>, body: impl Into<String>) -> Result<(),
 	let _tls_parameters =
 		ClientTlsParameters::new(cfg.credentials.domain.clone(), tls_builder.build()?);
 
-	pub const SUBMISSION_PORT: u16 = 25;
+	const SUBMISSION_PORT: u16 = 25;
 
 	let mut mailer = SmtpClient::new(
 		(cfg.credentials.domain.as_str(), SUBMISSION_PORT),
